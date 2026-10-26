@@ -1,0 +1,94 @@
+# CI/CD for the Playwright practice suite.
+#
+#   CI  (job: test)   - every push / PR / night: fresh Linux VM -> install -> typecheck -> run tests
+#   CD  (job: deploy) - after a run on main: publish the HTML report to GitHub Pages
+#
+# The runner is a brand-new machine each time. Anything not committed to the repo
+# (node_modules, browsers, reports) does not exist there until a step creates it.
+name: Playwright Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 2 * * *' # 02:30 UTC = 08:00 IST, catches the live site changing under us
+  workflow_dispatch: # "Run workflow" button in the Actions tab
+
+# A newer push to the same branch cancels the older run. Safe here: the tests only read a public site.
+concurrency:
+  group: playwright-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm' # reuses the npm download cache between runs
+
+      # `npm ci`, not `npm install`: installs exactly what package-lock.json says and fails if
+      # the lockfile is out of date, so CI runs the same versions as the laptop.
+      - name: Install dependencies
+        run: npm ci
+
+      # Only Chromium, because that is the only project in playwright.config.ts.
+      # --with-deps also installs the Linux libraries the browser needs.
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      # Cheap gate first: a type error fails in seconds instead of after the whole suite.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      # `!cancelled()`: upload even when tests FAILED, because that is when you need the report most.
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+      - name: Upload traces, screenshots, videos
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: test-results
+          path: test-results/
+          retention-days: 14
+
+      # Package the report in the format GitHub Pages expects (only for main, not PRs).
+      - name: Package report for Pages
+        uses: actions/upload-pages-artifact@v3
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        with:
+          path: playwright-report/
+
+  deploy:
+    needs: test
+    # Deploy even if tests failed: a red report on the site is still the truth.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # allowed to publish to GitHub Pages
+      id-token: write # proves to Pages that this run is really from this repo
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy report to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
